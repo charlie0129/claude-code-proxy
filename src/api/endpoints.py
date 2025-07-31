@@ -6,7 +6,7 @@ from typing import Optional
 
 from src.core.config import config
 from src.core.logging import logger
-from src.core.client import OpenAIClient
+from src.core.client import OpenAIClient, OpenAIClientManager
 from src.models.claude import ClaudeMessagesRequest, ClaudeTokenCountRequest
 from src.conversion.request_converter import convert_claude_to_openai
 from src.conversion.response_converter import (
@@ -17,15 +17,21 @@ from src.core.model_manager import model_manager
 
 router = APIRouter()
 
-openai_client = OpenAIClient(
-    config.openai_api_key,
-    config.openai_base_url,
-    config.request_timeout,
-    api_version=config.azure_api_version,
-)
+# Initialize client manager
+client_manager = OpenAIClientManager()
 
-async def validate_api_key(x_api_key: Optional[str] = Header(None), authorization: Optional[str] = Header(None)):
-    """Validate the client's API key from either x-api-key header or Authorization header."""
+# For backward compatibility, create a default client if OPENAI_API_KEY is set
+openai_client = None
+if config.openai_api_key:
+    openai_client = OpenAIClient(
+        config.openai_api_key,
+        config.openai_base_url,
+        config.request_timeout,
+        api_version=config.azure_api_version,
+    )
+
+async def get_client_api_key(x_api_key: Optional[str] = Header(None), authorization: Optional[str] = Header(None)):
+    """Extract and validate the client's API key from headers."""
     client_api_key = None
     
     # Extract API key from headers
@@ -34,20 +40,23 @@ async def validate_api_key(x_api_key: Optional[str] = Header(None), authorizatio
     elif authorization and authorization.startswith("Bearer "):
         client_api_key = authorization.replace("Bearer ", "")
     
-    # Skip validation if ANTHROPIC_API_KEY is not set in the environment
-    if not config.anthropic_api_key:
-        return
-        
     # Validate the client API key
     if not client_api_key or not config.validate_client_api_key(client_api_key):
         logger.warning(f"Invalid API key provided by client")
         raise HTTPException(
             status_code=401,
-            detail="Invalid API key. Please provide a valid Anthropic API key."
+            detail="Invalid API key. Please provide a valid API key."
         )
+    
+    # If using dynamic OpenAI keys, return the client's key as the OpenAI key
+    if config.use_dynamic_openai_key:
+        return client_api_key
+    
+    # Otherwise, use the configured OpenAI key
+    return config.openai_api_key
 
 @router.post("/v1/messages")
-async def create_message(request: ClaudeMessagesRequest, http_request: Request, _: None = Depends(validate_api_key)):
+async def create_message(request: ClaudeMessagesRequest, http_request: Request, openai_api_key: str = Depends(get_client_api_key)):
     try:
         logger.debug(
             f"Processing Claude request: model={request.model}, stream={request.stream}"
@@ -63,10 +72,21 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
         if await http_request.is_disconnected():
             raise HTTPException(status_code=499, detail="Client disconnected")
 
+        # Get the appropriate OpenAI client
+        if config.use_dynamic_openai_key:
+            client = await client_manager.get_client(
+                openai_api_key,
+                config.openai_base_url,
+                config.request_timeout,
+                config.azure_api_version
+            )
+        else:
+            client = openai_client
+
         if request.stream:
             # Streaming response - wrap in error handling
             try:
-                openai_stream = openai_client.create_chat_completion_stream(
+                openai_stream = client.create_chat_completion_stream(
                     openai_request, request_id
                 )
                 return StreamingResponse(
@@ -75,7 +95,7 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
                         request,
                         logger,
                         http_request,
-                        openai_client,
+                        client,
                         request_id,
                     ),
                     media_type="text/event-stream",
@@ -92,7 +112,7 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
                 import traceback
 
                 logger.error(traceback.format_exc())
-                error_message = openai_client.classify_openai_error(e.detail)
+                error_message = client.classify_openai_error(e.detail)
                 error_response = {
                     "type": "error",
                     "error": {"type": "api_error", "message": error_message},
@@ -100,7 +120,7 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
                 return JSONResponse(status_code=e.status_code, content=error_response)
         else:
             # Non-streaming response
-            openai_response = await openai_client.create_chat_completion(
+            openai_response = await client.create_chat_completion(
                 openai_request, request_id
             )
             claude_response = convert_openai_to_claude_response(
@@ -114,12 +134,12 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
 
         logger.error(f"Unexpected error processing request: {e}")
         logger.error(traceback.format_exc())
-        error_message = openai_client.classify_openai_error(str(e))
+        error_message = client.classify_openai_error(str(e))
         raise HTTPException(status_code=500, detail=error_message)
 
 
 @router.post("/v1/messages/count_tokens")
-async def count_tokens(request: ClaudeTokenCountRequest, _: None = Depends(validate_api_key)):
+async def count_tokens(request: ClaudeTokenCountRequest, openai_api_key: str = Depends(get_client_api_key)):
     try:
         # For token counting, we'll use a simple estimation
         # In a real implementation, you might want to use tiktoken or similar
@@ -217,6 +237,7 @@ async def root():
             "openai_base_url": config.openai_base_url,
             "max_tokens_limit": config.max_tokens_limit,
             "api_key_configured": bool(config.openai_api_key),
+            "dynamic_keys_enabled": config.use_dynamic_openai_key,
             "client_api_key_validation": bool(config.anthropic_api_key),
             "big_model": config.big_model,
             "small_model": config.small_model,
@@ -226,5 +247,19 @@ async def root():
             "count_tokens": "/v1/messages/count_tokens",
             "health": "/health",
             "test_connection": "/test-connection",
+            "metrics": "/metrics",
         },
+    }
+
+
+@router.get("/metrics")
+async def metrics():
+    """Get client manager metrics"""
+    return {
+        "client_manager": client_manager.get_metrics(),
+        "config": {
+            "use_dynamic_openai_key": config.use_dynamic_openai_key,
+            "max_clients": 50,
+            "client_ttl": 3600,
+        }
     }

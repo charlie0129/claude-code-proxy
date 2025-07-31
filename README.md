@@ -8,6 +8,7 @@ A proxy server that enables **Claude Code** to work with OpenAI-compatible API p
 
 - **Full Claude API Compatibility**: Complete `/v1/messages` endpoint support
 - **Multiple Provider Support**: OpenAI, Azure OpenAI, local models (Ollama), and any OpenAI-compatible API
+- **Dynamic API Key Support**: Use client's OpenAI keys when no server key is configured
 - **Smart Model Mapping**: Configure BIG and SMALL models via environment variables
 - **Function Calling**: Complete tool use support with proper conversion
 - **Streaming Responses**: Real-time SSE streaming support
@@ -46,26 +47,29 @@ uv run claude-code-proxy
 ### 4. Use with Claude Code
 
 ```bash
-# If ANTHROPIC_API_KEY is not set in the proxy:
-ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_API_KEY="any-value" claude
+# If OPENAI_API_KEY is not set (dynamic mode):
+ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_API_KEY="your-openai-key" claude
 
-# If ANTHROPIC_API_KEY is set in the proxy:
-ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_API_KEY="exact-matching-key" claude
+# If OPENAI_API_KEY is set (static mode):
+ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_API_KEY="any-value" claude
 ```
 
 ## Configuration
 
 ### Environment Variables
 
-**Required:**
+**API Keys (choose one mode):**
 
-- `OPENAI_API_KEY` - Your API key for the target provider
+- `OPENAI_API_KEY` - Your API key for the target provider (optional)
+  - If set: All requests use this key (static mode)
+  - If not set: Client's API key is used for each request (dynamic mode)
 
 **Security:**
 
-- `ANTHROPIC_API_KEY` - Expected Anthropic API key for client validation
-  - If set, clients must provide this exact API key to access the proxy
-  - If not set, any API key will be accepted
+- `ANTHROPIC_API_KEY` - Expected API key for client validation
+  - In static mode: Validates against this exact value
+  - In dynamic mode: Validates OpenAI key format (starts with `sk-`)
+  - If not set: Validation is disabled
 
 **Model Configuration:**
 
@@ -100,10 +104,21 @@ The proxy maps Claude model requests to your configured models:
 
 ### Provider Examples
 
-#### OpenAI
+#### OpenAI (Static Mode)
 
 ```bash
 OPENAI_API_KEY="sk-your-openai-key"
+OPENAI_BASE_URL="https://api.openai.com/v1"
+BIG_MODEL="gpt-4o"
+MIDDLE_MODEL="gpt-4o"
+SMALL_MODEL="gpt-4o-mini"
+```
+
+#### OpenAI (Dynamic Mode)
+
+```bash
+# Don't set OPENAI_API_KEY
+# Each client uses their own API key
 OPENAI_BASE_URL="https://api.openai.com/v1"
 BIG_MODEL="gpt-4o"
 MIDDLE_MODEL="gpt-4o"
@@ -157,15 +172,34 @@ response = httpx.post(
 
 This proxy is designed to work seamlessly with Claude Code CLI:
 
+### Static Mode (Single API Key)
+
 ```bash
-# Start the proxy
+# Start the proxy with your OpenAI key
+export OPENAI_API_KEY="sk-your-openai-key"
 python start_proxy.py
 
-# Use Claude Code with the proxy
-ANTHROPIC_BASE_URL=http://localhost:8082 claude
+# Use Claude Code with any API key value
+ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_API_KEY="any-value" claude
+```
 
-# Or set permanently
+### Dynamic Mode (Multiple Client Keys)
+
+```bash
+# Start the proxy without OPENAI_API_KEY
+python start_proxy.py
+
+# Each client uses their own OpenAI key
+ANTHROPIC_BASE_URL=http://localhost:8082 ANTHROPIC_API_KEY="client-openai-key" claude
+```
+
+### Permanent Setup
+
+```bash
+# Add to your shell profile
 export ANTHROPIC_BASE_URL=http://localhost:8082
+
+# Then simply run
 claude
 ```
 
@@ -210,13 +244,42 @@ claude-code-proxy/
 └── README.md                       # This file
 ```
 
+## Dynamic API Key Feature
+
+The proxy supports two modes of operation:
+
+### Static Mode (Default)
+- Configure `OPENAI_API_KEY` on the server
+- All clients share the same API key
+- Client keys are validated against `ANTHROPIC_API_KEY` if set
+
+### Dynamic Mode
+- Don't configure `OPENAI_API_KEY` on the server
+- Each client request uses their own API key
+- Client keys are validated to ensure proper OpenAI format
+- Supports multiple clients with different API keys
+
+### Benefits of Dynamic Mode
+- **Multi-tenant**: Serve multiple users with their own API keys
+- **No key sharing**: Clients keep their keys private
+- **Usage tracking**: Each client's usage is billed to their own account
+- **Flexible**: Works with any OpenAI-compatible provider
+
+### Client Management
+The proxy includes intelligent client management:
+- **LRU Caching**: Active clients are cached for performance
+- **Automatic Cleanup**: Idle clients are cleaned up after 1 hour
+- **Resource Limits**: Maximum 50 concurrent clients to prevent resource exhaustion
+- **Metrics**: Monitor client usage via `/metrics` endpoint
+
 ## Performance
 
 - **Async/await** for high concurrency
-- **Connection pooling** for efficiency
+- **Connection pooling** per client for efficiency
 - **Streaming support** for real-time responses
 - **Configurable timeouts** and retries
 - **Smart error handling** with detailed logging
+- **Efficient client management** with LRU caching
 
 ## License
 

@@ -5,8 +5,9 @@ import sys
 class Config:
     def __init__(self):
         self.openai_api_key = os.environ.get("OPENAI_API_KEY")
-        if not self.openai_api_key:
-            raise ValueError("OPENAI_API_KEY not found in environment variables")
+        
+        # Determine if we're using dynamic keys (client's OpenAI key)
+        self.use_dynamic_openai_key = not self.openai_api_key
         
         # Add Anthropic API key for client validation
         self.anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -32,6 +33,10 @@ class Config:
         
     def validate_api_key(self):
         """Basic API key validation"""
+        # If using dynamic keys, we don't need to validate a fixed key
+        if self.use_dynamic_openai_key:
+            return True
+            
         if not self.openai_api_key:
             return False
         # Basic format check for OpenAI API keys
@@ -40,17 +45,25 @@ class Config:
         return True
         
     def validate_client_api_key(self, client_api_key):
-        """Validate client's Anthropic API key"""
+        """Validate client's API key"""
         # If no ANTHROPIC_API_KEY is set in the environment, skip validation
         if not self.anthropic_api_key:
             return True
+            
+        # When using dynamic OpenAI keys, validate the key format instead
+        if self.use_dynamic_openai_key:
+            # Basic format check for OpenAI API keys
+            return client_api_key and client_api_key.startswith('sk-')
             
         # Check if the client's API key matches the expected value
         return client_api_key == self.anthropic_api_key
 
 try:
     config = Config()
-    print(f" Configuration loaded: API_KEY={'*' * 20}..., BASE_URL='{config.openai_base_url}'")
+    if config.use_dynamic_openai_key:
+        print(f"\033[34m Configuration loaded: Using dynamic client keys, BASE_URL='{config.openai_base_url}'")
+    else:
+        print(f"\033[34m Configuration loaded: API_KEY={'*' * 20}..., BASE_URL='{config.openai_base_url}'")
 except Exception as e:
     print(f"=4 Configuration Error: {e}")
     sys.exit(1)

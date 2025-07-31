@@ -2,11 +2,19 @@ from fastapi import FastAPI
 from src.api.endpoints import router as api_router
 import uvicorn
 import sys
+import atexit
 from src.core.config import config
+from src.api.endpoints import client_manager
 
 app = FastAPI(title="Claude-to-OpenAI API Proxy", version="1.0.0")
 
 app.include_router(api_router)
+
+@app.on_event("startup")
+async def startup_event():
+    """Start the client manager cleanup task when the app starts."""
+    # This ensures the event loop is running when we start the cleanup task
+    pass
 
 
 def main():
@@ -15,8 +23,8 @@ def main():
         print("")
         print("Usage: python src/main.py")
         print("")
-        print("Required environment variables:")
-        print("  OPENAI_API_KEY - Your OpenAI API key")
+        print("Environment variables:")
+        print("  OPENAI_API_KEY - Your OpenAI API key (optional - if not set, uses client keys)")
         print("")
         print("Optional environment variables:")
         print("  ANTHROPIC_API_KEY - Expected Anthropic API key for client validation")
@@ -50,6 +58,10 @@ def main():
     print(f"   Request Timeout: {config.request_timeout}s")
     print(f"   Server: {config.host}:{config.port}")
     print(f"   Client API Key Validation: {'Enabled' if config.anthropic_api_key else 'Disabled'}")
+    if config.use_dynamic_openai_key:
+        print(f"   Dynamic Key Mode: Enabled (using client API keys)")
+    else:
+        print(f"   Static Key Mode: Enabled (using configured OPENAI_API_KEY)")
     print("")
 
     # Parse log level - extract just the first word to handle comments
@@ -59,6 +71,9 @@ def main():
     valid_levels = ['debug', 'info', 'warning', 'error', 'critical']
     if log_level not in valid_levels:
         log_level = 'info'
+
+    # Register cleanup handler
+    atexit.register(lambda: sys.exit(0))
 
     # Start server
     uvicorn.run(

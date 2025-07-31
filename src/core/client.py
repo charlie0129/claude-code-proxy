@@ -1,10 +1,137 @@
 import asyncio
 import json
+import time
+import logging
 from fastapi import HTTPException
 from typing import Optional, AsyncGenerator, Dict, Any
 from openai import AsyncOpenAI, AsyncAzureOpenAI
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
 from openai._exceptions import APIError, RateLimitError, AuthenticationError, BadRequestError
+
+logger = logging.getLogger(__name__)
+
+
+class OpenAIClientManager:
+    """Manages OpenAI client instances with LRU caching and automatic cleanup."""
+    
+    def __init__(self, max_clients: int = 50, client_ttl: int = 3600):
+        self.max_clients = max_clients
+        self.client_ttl = client_ttl
+        self.clients = {}  # api_key -> client
+        self.last_used = {}  # api_key -> timestamp
+        self.lock = asyncio.Lock()
+        self.cleanup_task = None
+        self.metrics = {
+            'clients_created': 0,
+            'cache_hits': 0,
+            'cache_misses': 0,
+            'active_clients': 0,
+            'clients_evicted': 0
+        }
+        self._cleanup_started = False
+    
+    def _start_cleanup_task(self):
+        """Start the background cleanup task."""
+        if not self._cleanup_started:
+            self.cleanup_task = asyncio.create_task(self._cleanup())
+            self._cleanup_started = True
+    
+    async def _cleanup(self):
+        """Periodically clean up idle clients."""
+        while True:
+            try:
+                await asyncio.sleep(300)  # Check every 5 minutes
+                await self._cleanup_idle_clients()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in client cleanup task: {e}")
+    
+    async def _cleanup_idle_clients(self):
+        """Remove clients that haven't been used for client_ttl seconds."""
+        async with self.lock:
+            now = time.time()
+            expired_keys = []
+            
+            for key, last_used in self.last_used.items():
+                if now - last_used > self.client_ttl:
+                    expired_keys.append(key)
+            
+            for key in expired_keys:
+                logger.info(f"Cleaning up idle client for key: {key[:10]}...")
+                await self.clients[key].close()
+                del self.clients[key]
+                del self.last_used[key]
+                self.metrics['clients_evicted'] += 1
+    
+    async def get_client(self, api_key: str, base_url: str, timeout: int = 90, 
+                        api_version: Optional[str] = None) -> 'OpenAIClient':
+        """Get or create a client for the given API key."""
+        # Start cleanup task on first access
+        if not self._cleanup_started:
+            self._start_cleanup_task()
+        
+        async with self.lock:
+            # Check cache hit
+            if api_key in self.clients:
+                self.metrics['cache_hits'] += 1
+                self.last_used[api_key] = time.time()
+                return self.clients[api_key]
+            
+            # Cache miss - create new client
+            self.metrics['cache_misses'] += 1
+            
+            # Evict oldest if at max capacity
+            if len(self.clients) >= self.max_clients:
+                oldest_key = min(self.last_used.keys(), key=self.last_used.get)
+                logger.info(f"Evicting oldest client for key: {oldest_key[:10]}...")
+                await self.clients[oldest_key].close()
+                del self.clients[oldest_key]
+                del self.last_used[oldest_key]
+                self.metrics['clients_evicted'] += 1
+            
+            # Create new client
+            logger.info(f"Creating new client for key: {api_key[:10]}...")
+            client = OpenAIClient(
+                api_key=api_key,
+                base_url=base_url,
+                timeout=timeout,
+                api_version=api_version
+            )
+            
+            self.clients[api_key] = client
+            self.last_used[api_key] = time.time()
+            self.metrics['clients_created'] += 1
+            self.metrics['active_clients'] = len(self.clients)
+            
+            return client
+    
+    async def close_all(self):
+        """Close all client instances."""
+        async with self.lock:
+            for client in self.clients.values():
+                await client.close()
+            self.clients.clear()
+            self.last_used.clear()
+            self.metrics['active_clients'] = 0
+        
+        # Cancel cleanup task
+        if self.cleanup_task:
+            self.cleanup_task.cancel()
+            try:
+                await self.cleanup_task
+            except asyncio.CancelledError:
+                pass
+    
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get current metrics."""
+        return {
+            **self.metrics,
+            'cached_clients': len(self.clients),
+            'max_clients': self.max_clients,
+            'client_ttl': self.client_ttl
+        }
+
 
 class OpenAIClient:
     """Async OpenAI client with cancellation support."""
@@ -170,3 +297,13 @@ class OpenAIClient:
             self.active_requests[request_id].set()
             return True
         return False
+    
+    async def close(self):
+        """Close the underlying OpenAI client and cleanup resources."""
+        if hasattr(self, 'client'):
+            await self.client.close()
+        
+        # Cancel any active requests
+        for request_id, cancel_event in self.active_requests.items():
+            cancel_event.set()
+        self.active_requests.clear()
